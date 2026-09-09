@@ -1,0 +1,10 @@
+*.log
+*.key
+*.pem
+*.env
+authorized_keys
+config.yaml
+config.yml
+secrets/
+.idea/
+.vscode/
