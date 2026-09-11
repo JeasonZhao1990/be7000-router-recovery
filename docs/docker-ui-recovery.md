@@ -17,7 +17,12 @@
 - 当前 USB 存储路径，例如 `/mnt/usb-xxxx/...`；
 - `/var/run/docker.sock`。
 
-本次故障由 3 个已经停止的临时诊断容器引起，共有 4 条违规挂载，来源为 `/`、`/dev` 和 `/sys`。Mihomo 容器的挂载都位于 USB 路径下，不是故障源。
+本项目遇到过两类触发源：
+
+1. 已停止维护容器挂载 `/`、`/dev`、`/sys` 等系统路径；
+2. 2026-09-11 的 R10 正式容器和 4 个临时诊断容器从 `/tmp/*.sh` 挂载启动脚本。
+
+第二次修复采用 R11 事务式迁移：先存档容器配置和日志，把 R10 启动脚本迁移到 USB 下的 `persistent-scripts/`，再重建两个 R10 容器；4 个临时容器存档后删除。随后又归档并删除 126 个无数据卷测试容器。最终违规挂载为 0。
 
 ## 只读检查
 
@@ -50,7 +55,13 @@ DOCKER_HOST=unix:///var/run/docker.sock
   --format '{{.Name}} state={{.State.Status}}{{println}}{{range .Mounts}}{{.Source}} -> {{.Destination}} rw={{.RW}}{{println}}{{end}}'
 ```
 
-重点检查已停止的诊断或维护容器是否挂载了 `/`、`/dev`、`/sys`、`/proc` 等系统路径。
+重点检查所有容器（运行和停止）是否挂载了 `/tmp`、`/root`、`/`、`/dev`、`/sys`、`/proc` 等非 USB 系统路径。
+
+仓库提供只读扫描脚本：
+
+```sh
+/bin/sh scripts/audit-mount-sources.sh
+```
 
 ## 最小修复
 
@@ -77,7 +88,7 @@ echo "integrity_exit=$?"
 echo "running_exit=$?"
 ```
 
-本次最终结果均为 `0`，刷新小米后台后 Docker 恢复“运行中”，第三方管理工具恢复“可用”。
+2026-09-11 最终现场结果：`check_integrity=0`、`is_running=0`、违规挂载为 0，Docker Engine 及 6 个保留容器全部运行。
 
 ## 不推荐的方法
 
