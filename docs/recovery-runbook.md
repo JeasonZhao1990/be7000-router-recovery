@@ -1,145 +1,260 @@
 # 完整恢复顺序与回滚
 
-本文记录 2026-09-11 已验证的现场顺序。目标是恢复现有安装，不是无条件重装 Docker。
+本文记录当前生产架构的恢复顺序。目标是恢复现有安装，不是无条件重装 Docker。
 
 ## 0. 安全边界
 
-- 不重启路由器，不拔移动硬盘；
-- 不运行 `docker system prune`，不使用 `docker rm -v`；
+- 不运行 `docker system prune`；
+- 不使用 `docker rm -v` 清理未知容器；
+- 不删除 Docker 数据目录；
+- 不删除或覆盖小米固件已有 IPv6 policy rule；
+- 不从 `/tmp`、`/root` 或根目录给长期容器 bind mount；
 - 不把 VLESS 配置、SSH 私钥、设备标识或完整日志提交到 Git；
-- 每次只改变一层，先 core 后 rules；停止时反向，先 rules 后 core；
-- 所有常驻脚本必须放在 `/mnt/usb-xxxx/...`。
+- 每次只改变一层，必须保留回滚路径；
+- 如果只是代理节点线路慢，不通过叠加路由/防火墙规则处理。
 
 ## 1. 建立 SSH
 
-Windows 连接方式见 [SSH 持久化](ssh-persistence.md)。登录后先确认：
+Windows 连接方式见 [SSH 持久化](ssh-persistence.md)。
+
+登录后先确认：
 
 ```sh
 nvram get ssh_en
 uci -q show dropbear
+uci -q show firewall.auto_ssh
 ```
 
-## 2. 定位 Docker 与 USB 路径
+## 2. 定位 Docker 与 USB
 
-现场路径如下，其他机器必须替换 `usb-xxxx`：
+不要把 USB mount suffix 写死到新脚本。先查找：
+
+```sh
+for x in /mnt/usb-*/mi_docker/docker-binaries/docker; do
+    [ -x "$x" ] && echo "$x"
+done
+```
+
+然后：
 
 ```sh
 DOCKER=/mnt/usb-xxxx/mi_docker/docker-binaries/docker
-HOST=unix:///var/run/docker.sock
-BASE=/mnt/usb-xxxx/be7000_proxy_20260904
-
-"$DOCKER" -H "$HOST" version
-"$DOCKER" -H "$HOST" ps -a
+"$DOCKER" version
+"$DOCKER" ps -a
 ```
 
-必须先确认 Docker 20.10.17、linux/arm64、数据目录和移动硬盘均可访问。
-
-## 3. 准备私密 bundle
-
-GitHub 不保存以下文件的真实内容：
-
-```text
-$BASE/config.json
-$BASE/rules/cn-domain.mrs
-$BASE/rules/cn-ip.mrs
-```
-
-`config.json` 包含私密 VLESS/Reality 参数，只能从自己的离线备份恢复。启动前运行 Mihomo 配置检查并重新计算 SHA256；不要照抄文档中的历史校验值覆盖新文件。
-
-## 4. 恢复基础 R6
-
-R6 是稳定回落路径：
-
-1. 确认核心镜像和观察工具镜像仍存在；
-2. 确认 bundle 三个文件哈希符合自己的备份；
-3. 创建 `be7000-family-proxy-core-r6-20260907`，使用 host 网络、只读根文件系统、`NET_ADMIN`/`NET_RAW`、96 MiB 内存、USB bundle 只读挂载；
-4. 启动 core，确认 TCP 7895 和 DNS 7853 监听；
-5. 将 `scripts/reference/persistent-family-rules-guard-r6.sh` 放入 USB，计算 SHA256；该脚本会直接修改防火墙，只能由经过审核、带回滚的 rules 容器运行；
-6. 创建 rules 容器并通过 `EXPECTED_SELF_SHA256` 传入该值；
-7. 启动 rules，确认 `B7G_0904_PERSISTENT_FAMILY_REDIR_DNS` 对 `br-lan` 和 `br-miot` 各只有一个 hook。
-
-如果 R6 已运行，不要重新创建。
-
-## 5. 恢复 R10 HTTPS 目标纠正层
-
-R10 依赖 R6，不能替代 R6。将以下脚本复制到 USB：
-
-```text
-$BASE/persistent-scripts/family-override-core-r10.sh
-$BASE/persistent-scripts/family-override-guard-r10.sh
-```
-
-R10 core 的关键创建参数：
-
-```text
-name=be7000-family-override-core-r10-20260911
-network=host
-read-only=true
-cap-drop=ALL
-cap-add=NET_ADMIN,NET_RAW
-memory=192 MiB
-pids-limit=64
-cpus=0.25
-nofile=8192:8192
-restart=always
-bundle mount=USB -> /bundle, read-only
-script mount=USB -> /core.sh, read-only
-```
-
-R10 rules 的关键参数：
-
-```text
-name=be7000-family-override-rules-r10-20260911
-network=host
-pid=container:R10-core
-read-only=true
-cap-drop=ALL
-cap-add=NET_ADMIN,NET_RAW
-memory=64 MiB
-pids-limit=32
-cpus=0.25
-restart=always
-script mount=USB -> /guard.sh, read-only
-```
-
-启动 core 后确认 7897 监听，再启动 rules。确认 TCP/443 hook 标记 `B7G_0911_FAMILY_OVERRIDE_R10` 在 `br-lan` 和 `br-miot` 各出现一次。
-
-禁止使用 `/tmp/*.sh` 作为 bind mount；这会再次触发小米 `valid_mountpath()` 误判。
-
-## 6. 恢复 IPv6 WAN 防护
-
-将 `scripts/reference/family-ipv6-wan-guard-r17.sh` 放到 USB，按其 SHA256 创建容器。只允许它创建私有 nft table `b7g_ipv6_wan_guard_17`，作用域应为：
-
-```text
-br-lan,br-miot -> pppoe-wan：全球 IPv6 reject
-局域网、本地链路 IPv6：保留
-```
-
-## 7. 验证顺序
-
-1. `check_integrity=0`、`is_running=0`；
-2. 恰好 6 个保留容器，全部 `running|always`；
-3. 无非 USB/system-socket 挂载；
-4. 百度与米家正常；
-5. Google、Wikipedia 正常；
-6. `api.ipify.org` 显示代理 IPv4；
-7. `api6.ipify.org` 无法访问（当前设计如此）；
-8. ChatGPT App 与桌面端均能保持连接。
-
-## 8. 故障时的最小回滚
-
-如果启用 R10 后 ChatGPT 或家庭网络异常，只停 R10：
-
-先把仓库中的脚本复制到 USB，再在路由器上执行：
+## 3. Docker 官方健康检查
 
 ```sh
-/bin/sh /mnt/usb-xxxx/be7000_proxy_20260904/persistent-scripts/stop-r10-overlay.sh --confirm
+/etc/init.d/mi_docker check_integrity
+echo "integrity_exit=$?"
+
+/etc/init.d/mi_docker is_running
+echo "running_exit=$?"
 ```
 
-该顺序先停 rules，再停 core，R6 保持运行。恢复 R10 前先检查节点日志和 7897 监听，然后运行：
+预期两项均为 0。
+
+如果失败，优先排查容器挂载来源，不要先删除数据目录。
+
+## 4. 核对生产容器
+
+当前重点检查：
+
+```text
+be7000-family-tun-r3-unified
+be7000-family-proxy-core-r6-20260907
+be7000-family-proxy-rules-r6-20260907
+be7000-family-override-core-r10-20260911
+be7000-family-override-rules-r10-20260911
+be7000-family-ipv6-wan-guard-r17-20260908
+simple-docker
+openlist
+```
+
+R1/R2 测试容器已删除，不应为了“恢复”重新创建，除非重新做实验。
+
+## 5. 恢复 R6/R10 旧回退路径
+
+如果 R6/R10 已运行，不要重建。
+
+先确认：
+
+- R6 core/rules 运行；
+- R10 core/rules 运行；
+- R10 HTTPS listener 存在；
+- IPv6 guard 存在；
+- 没有来自 `/tmp` 或根目录的违规长期 bind mount。
+
+旧路径仍有 `br-miot` 兼容和 R3 故障回退价值。
+
+## 6. 恢复 R3 core
+
+R3 配置应位于 USB 持久目录。
+
+关键条件：
+
+```text
+network=host
+TUN=b7g-tun-r3
+MTU=1400
+auto-route=false
+auto-redirect=false
+strict-route=true
+IPv4/IPv6=true
+DNS IPv6=true
+restart=always
+```
+
+`HOME-VLESS` 当前额外使用：
+
+```json
+"ip-version": "ipv4"
+```
+
+该字段只用于节点接入 A/B 后的稳定性优化，不代表客户端 IPv6 被关闭。
+
+启动或切换配置前，先使用 Mihomo 自身做配置检查。现场容器目录挂载到 `/run/mihomo`，因此候选配置可这样测试：
 
 ```sh
-/bin/sh /mnt/usb-xxxx/be7000_proxy_20260904/persistent-scripts/start-r10-overlay.sh --confirm
+docker exec be7000-family-tun-r3-unified \
+  /usr/local/bin/mihomo \
+  -t \
+  -d /run/mihomo \
+  -f /run/mihomo/<candidate-config>.json
 ```
 
-如果 R6 本身异常，停止继续操作并保留 SSH 会话；不要在同一轮叠加新规则或重启路由器。
+不得把真实 config 上传到 Git。
+
+## 7. 恢复 Family policy
+
+生产脚本位于：
+
+```text
+/data/be7000-r3-family/
+```
+
+正常情况下由：
+
+```text
+/data/be7000-r3-family/restore.sh
+```
+
+完成恢复。
+
+restore 会：
+
+- 加锁；
+- 等待 R3/R6/R10/guard 就绪；
+- 重试 apply；
+- 动态发现当前 LAN IPv6 `/64`；
+- 建立 table 2074；
+- 恢复 IPv4/IPv6 policy；
+- 恢复 DNS/TUN FORWARD；
+- 恢复 IPv4 fail-closed；
+- 让 `br-lan` 绕过旧 R6/R10。
+
+## 8. 验证 Family
+
+```sh
+ip link show b7g-tun-r3
+ip route show table 2074
+ip -6 route show table 2074
+ip rule show
+ip -6 rule show
+```
+
+客户端 route-get 应显示 `br-lan` 公网目标进入 table 2074/TUN。
+
+不要要求 Mihomo 自建 IPv6 TUN `oif` rule 固定为某个 preference；该 preference 可变化。
+
+## 9. 恢复持久化 hook
+
+应存在：
+
+```sh
+uci -q show firewall.auto_ssh
+uci -q show firewall.r3_family
+```
+
+对应：
+
+```text
+/data/auto_ssh/auto_ssh.sh
+/data/be7000-r3-family/firewall-hook.sh
+```
+
+如果 hook 丢失，先恢复 UCI include，再做受控 firewall reload。
+
+## 10. firewall reload 验证
+
+只有在 SSH 管理通道稳定时执行。
+
+reload 后检查：
+
+- Family restore 日志；
+- R3 TUN；
+- table 2074；
+- DNS；
+- IPv4/IPv6 fail-closed；
+- 客户端网页和米家。
+
+不要在 reload 失败后马上重启路由器；先保留 SSH 会话并执行 rollback/旧路径恢复。
+
+## 11. 整机 reboot 恢复预期
+
+当前架构已经通过真实 reboot 验证。
+
+启动顺序允许出现短暂依赖未就绪：
+
+1. Docker 启动；
+2. R3/R6/R10/guard 容器恢复；
+3. firewall include 调用 Family restore；
+4. restore 发现依赖未就绪时重试；
+5. PPPoE/IPv6 前缀稳定后动态写入当前 `/64`；
+6. Family 恢复完成。
+
+如果网络在启动初期短暂不可用属于恢复窗口；最终不应需要人工 SSH 修规则。
+
+## 12. MIoT / br-miot
+
+当前不要为 `br-miot` 增加新的持久化 R3 hook。
+
+原因：
+
+- 现场没有真实 `br-miot` station；
+- `br-miot` 迁移已经做过非持久化 apply/rollback；
+- 真正米家设备主要位于 `br-lan`。
+
+只有未来 `wl13/br-miot` 出现真实客户端时，再重新做 canary。
+
+## 13. 故障时的最小回滚
+
+如果 R3/Family 异常：
+
+1. 保持 SSH；
+2. 不删除任何生产容器；
+3. 执行 `/data/be7000-r3-family/rollback.sh`；
+4. 确认 R6/R10 旧链恢复 `br-lan`；
+5. 保留 IPv6 guard；
+6. 再分析 R3 日志和配置。
+
+如果只是 `HOME-VLESS` 节点慢：
+
+- 不 rollback Family；
+- 不关闭客户端 IPv6；
+- 不盲目改 TUN MTU；
+- 先测节点 RTT、丢包、TLS/TTFB；
+- 优先更换或增加更优节点。
+
+## 14. 测试容器清理
+
+R1/R2 已删除，不需要再次清理。
+
+如果未来出现新的实验容器：
+
+- 先核对名称；
+- 核对 `restart policy`；
+- 核对 mounts/volumes；
+- 确认不是生产依赖；
+- 删除时不带 `-v`。
